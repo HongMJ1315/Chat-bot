@@ -10,6 +10,7 @@ import numpy as np
 import pyaudio
 from config import *
 import concurrent.futures
+import speech_recognition as sr
 
 from TTS.TTService import TTService
 
@@ -31,6 +32,9 @@ tts_service = None
 is_playing = {}  # 使用字典來管理每個伺服器的播放狀態
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)  # 新增線程池
 audio_queues = {}  # 使用字典來管理每個伺服器的音頻播放隊列
+recognizer = sr.Recognizer()
+audio_tasks = {}
+listener_tasks = {}
 
 def model_init():
     global tts_service
@@ -111,6 +115,50 @@ async def get_llm_response(prompt, timeout=120):
         return chinese_converter.to_traditional(response)
     except asyncio.TimeoutError:
         return "抱歉，模型回應時間過長。請稍後再試。"
+    
+async def listen_and_speak(ctx, voice_client):
+    recognizer.energy_threshold = 4000  # 手動調整靈敏度（越高越不敏感）
+
+    # 自動調整靈敏度 (建議在安靜環境中使用一次)
+    with sr.Microphone() as source:
+        recognizer.adjust_for_ambient_noise(source, duration=1)
+
+    while True:
+        with sr.Microphone() as source:
+            print("請說話...")
+            try:
+                loop = asyncio.get_event_loop()
+
+                # 將同步的 listen 函數放入執行緒池中
+                audio = await loop.run_in_executor(None, recognizer.listen, source, 10)  # 設定超時與語音限制
+                # audio = recognizer.listen(source, timeout=10)  # 等待最多10秒來檢測語音開始
+                print("已經捕捉到語音輸入，處理中...")
+
+                # 嘗試使用Google Web Speech API進行語音轉文字
+                try:
+                    # 使用執行緒池來非同步執行阻塞的 Google 語音識別
+                    text = await loop.run_in_executor(None, recognizer.recognize_google, audio, None, 'zh-TW')
+                    print(f"你說了: {text}")
+
+                    # 使用 LLM 生成回覆
+                    prompt = LLM_PROMPT + LLM_REPLY_PROMPT + text
+                    response = await get_llm_response(prompt)
+                    response = chinese_converter.to_traditional(response)
+                    print(f"回應: {response}")
+
+                    # 播放 LLM 回覆的 TTS 音頻
+                    await add_to_queue(ctx, response)
+                    
+                except sr.UnknownValueError:
+                    print("抱歉，我無法理解您說的話。")
+                except sr.RequestError as e:
+                    print(f"無法連接到Google Web Speech API; {e}")
+
+            except sr.WaitTimeoutError:
+                print("沒有檢測到語音輸入。")
+
+        await asyncio.sleep(1)  # 添加短暫的休眠以避免占用過多資源
+
 
 # 機器人加入伺服器時觸發事件
 @bot.event
@@ -209,12 +257,35 @@ async def chat(ctx, *, message: str):
             await ctx.reply(response)
 
 @bot.command()
+async def listen(ctx, *, message: str):
+    if(ctx.author.voice is None):
+        await ctx.send("請先加入語音頻道。")
+        return
+    # 檢查機器人是否已經加入語音頻道 若未加入則提示使用!join指令
+    if ctx.voice_client is None:
+        await ctx.send("請先加入語音頻道。")
+        return
+    # 若message為空則提示使用者輸入文字
+    if not message:
+        await ctx.send("請輸入start/stop")
+        return
+    guild_id = ctx.guild.id
+    if(message == "start"):
+        listener_tasks[guild_id] = bot.loop.create_task(listen_and_speak(ctx, ctx.voice_client))  # 將ctx傳入
+        await ctx.send("啟動STT")
+    elif(message == "stop"):
+        listener_tasks[guild_id].cancel()
+        del listener_tasks[guild_id]
+        await ctx.send("停止STT")
+
+@bot.command()
 async def join(ctx):
     if ctx.author.voice:
         channel = ctx.author.voice.channel
         await channel.connect()
-        bot.loop.create_task(audio_player(ctx))  
-        
+        guild_id = ctx.guild.id
+        audio_tasks[guild_id] = bot.loop.create_task(audio_player(ctx))
+
 @bot.command()
 async def leave(ctx):
     if ctx.voice_client:
@@ -222,13 +293,20 @@ async def leave(ctx):
         guild_id = ctx.guild.id
         if guild_id in is_playing:
             is_playing[guild_id] = False
+        if(guild_id in audio_tasks):
+            audio_tasks[guild_id].cancel()
+            del audio_tasks[guild_id]
 
 @bot.command()
 async def tts(ctx, *, message: str):
     if ctx.voice_client:
+        print('================ctx==================')
+        print(ctx)
+        print('=====================================')
+
         await add_to_queue(ctx, message)
     else:
-        await ctx.send("請先加入語音頻道。")
+        await ctx.send("請先加入語音頻道")
 
 
 # 機器人啟動事件
